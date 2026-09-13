@@ -4,6 +4,11 @@ This directory is a self-contained, read-only deployment bundle. It contains
 the dashboard and only the finalized precomputed tables used at runtime. It
 does not run or rebuild the GRN, TF-gene correlation, pathway, or MAGMA analyses.
 
+Large dashboard tables are partitioned by TF or archetype so the app loads only
+the selected view. This keeps startup memory within Streamlit Community Cloud's
+resource limits; `build_cloud_partitions.py` records how those deployment-only
+partitions were generated from the finalized tables.
+
 ## Test locally
 
 ```bash

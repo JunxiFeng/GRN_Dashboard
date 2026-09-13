@@ -25,11 +25,27 @@ st.set_page_config(page_title="SC.beta GRN -- TF-centric dashboard", layout="wid
 @st.cache_data
 def load_core():
     summary = pd.read_csv(f"{DD}/TF_centric_target_summary.tsv", sep="\t")
-    gene_edges = pd.read_csv(f"{DD}/TF_centric_gene_edges.tsv.gz", sep="\t", low_memory=False)
-    cre_edges = pd.read_csv(f"{DD}/TF_centric_CRE_gene_edges.tsv.gz", sep="\t", low_memory=False)
-    struct = pd.read_parquet(f"{DD}/archetype_structural_CRE_gene_edges.parquet")
     cand_tf = pd.read_csv(f"{GRN}/tables/archetype_candidate_TFs.tsv", sep="\t")
-    return summary, gene_edges, cre_edges, struct, cand_tf
+    structural_summary = pd.read_csv(f"{DD}/global_structural_summary.tsv", sep="\t").iloc[0]
+    archetype_edge_counts = pd.read_csv(f"{DD}/archetype_structural_edge_counts.tsv", sep="\t")
+    return summary, cand_tf, structural_summary, archetype_edge_counts
+
+def safe_partition_name(value):
+    return str(value).replace("/", "__")
+
+@st.cache_data(max_entries=4)
+def load_selected_network(tf, archetype):
+    tf_name = safe_partition_name(tf)
+    archetype_name = safe_partition_name(archetype)
+    gene_path = f"{DD}/TF_centric_gene_edges_by_TF/{tf_name}.parquet"
+    cre_path = f"{DD}/TF_centric_CRE_gene_edges_by_TF/{tf_name}.parquet"
+    structural_path = f"{DD}/archetype_structural_CRE_gene_edges_by_archetype/{archetype_name}.parquet"
+    gene_edges = pd.read_parquet(gene_path) if os.path.exists(gene_path) else pd.DataFrame(
+        columns=["TF", "frozen_archetype", "resolution", "gene", "empirical_p"])
+    cre_edges = pd.read_parquet(cre_path) if os.path.exists(cre_path) else pd.DataFrame(
+        columns=["TF", "frozen_archetype", "gene", "CRE_id"])
+    struct = pd.read_parquet(structural_path)
+    return gene_edges, cre_edges, struct
 
 @st.cache_data
 def load_sequence_context():
@@ -41,13 +57,13 @@ def load_condition_associations(tf):
     path = f"{DD}/condition_specific_TF_gene_associations/{tf}.tsv.gz"
     return pd.read_csv(path, sep="\t", low_memory=False)
 
-@st.cache_data
-def load_pathways():
-    results_path = f"{DD}/condition_specific_pathway_enrichment.tsv.gz"
+@st.cache_data(max_entries=4)
+def load_pathways(tf):
+    results_path = f"{DD}/condition_specific_pathway_enrichment_by_TF/{safe_partition_name(tf)}.parquet"
     summary_path = f"{DD}/condition_specific_pathway_enrichment_summary.tsv"
     if not os.path.exists(results_path) or not os.path.exists(summary_path):
         return None, None
-    return (pd.read_csv(results_path, sep="\t", low_memory=False),
+    return (pd.read_parquet(results_path),
             pd.read_csv(summary_path, sep="\t", low_memory=False))
 
 @st.cache_data
@@ -67,9 +83,8 @@ def load_finalized_disease_magma():
         archetype_results[label] = pd.read_csv(path, sep="\t") if os.path.exists(path) else pd.DataFrame()
     return tf_results, archetype_results
 
-summary, gene_edges, cre_edges, struct, cand_tf = load_core()
+summary, cand_tf, structural_summary, archetype_edge_counts = load_core()
 seq_ctx = load_sequence_context()
-pathways, pathway_summary = load_pathways()
 tf_condition_magma, archetype_magma = load_finalized_disease_magma()
 
 candidate_tfs = set(cand_tf[cand_tf["usable_for_candidate_TF_assignment"] == True]["candidate_TF"].dropna())
@@ -94,6 +109,9 @@ arch_sel = st.sidebar.selectbox("Compatible archetype", tf_archs, key="selected_
 if unmapped_tf:
     st.sidebar.caption(f"{len(unmapped_tf):,} candidate TFs without a represented frozen archetype are hidden.")
 
+gene_edges, cre_edges, struct = load_selected_network(tf_sel, arch_sel)
+pathways, pathway_summary = load_pathways(tf_sel)
+
 tf_row = summary[(summary["TF"] == tf_sel) & (summary["frozen_archetype"] == arch_sel)]
 
 st.title(f"TF: {tf_sel}  |  Archetype: {arch_sel}")
@@ -110,11 +128,11 @@ with tabs[0]:
 
     structural_edges = struct.drop_duplicates(subset=["frozen_archetype", "CRE_id", "gene"])
     global_counts = st.columns(5)
-    global_counts[0].metric("Archetypes", f"{seq_ctx['frozen_archetype'].nunique():,}")
-    global_counts[1].metric("Unique structural CREs", f"{structural_edges['CRE_id'].nunique():,}")
-    global_counts[2].metric("Unique structural genes", f"{structural_edges['gene'].nunique():,}")
-    global_counts[3].metric("Raw structural table rows", f"{len(struct):,}")
-    global_counts[4].metric("Unique structural edges", f"{len(structural_edges):,}")
+    global_counts[0].metric("Archetypes", f"{int(structural_summary['n_archetypes']):,}")
+    global_counts[1].metric("Unique structural CREs", f"{int(structural_summary['n_unique_CREs']):,}")
+    global_counts[2].metric("Unique structural genes", f"{int(structural_summary['n_unique_genes']):,}")
+    global_counts[3].metric("Raw structural table rows", f"{int(structural_summary['n_raw_rows']):,}")
+    global_counts[4].metric("Unique structural edges", f"{int(structural_summary['n_unique_edges']):,}")
     st.caption("The frozen structural table has 1,208,323 raw rows. Deduplicating exact "
                "(frozen_archetype, CRE_id, gene) keys yields 878,197 unique structural edges; "
                "330,126 rows are repeated copies of an existing structural key.")
@@ -168,9 +186,7 @@ with tabs[0]:
         spine.set_visible(False)
     st.pyplot(overview_fig)
 
-    edge_counts = (structural_edges.groupby("frozen_archetype").size()
-                   .rename("n_structural_edges").reset_index())
-    scatter_data = seq_ctx.merge(edge_counts, on="frozen_archetype", how="left")
+    scatter_data = seq_ctx.merge(archetype_edge_counts, on="frozen_archetype", how="left")
     st.markdown("##### C. Structural CREs and target genes")
     scatter_fig, scatter_ax = plt.subplots(figsize=(8, 5))
     point_sizes = 20 + 280 * scatter_data["n_structural_edges"] / scatter_data["n_structural_edges"].max()
